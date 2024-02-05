@@ -31,23 +31,9 @@ import java.util.List;
 @Setter
 @EqualsAndHashCode
 @ToString
-public class Envelope {
-
-    //private String id;
-
-    private String topic;
-
-    private Integer partition;
-
-    private Long offset;
-
-    private Long ts;
+public class Header {
 
     private String key;
 
-    private String payload;
-
-    //private List<Header> headers;
-
-    private List<String> headers;
+    private String value;
 }

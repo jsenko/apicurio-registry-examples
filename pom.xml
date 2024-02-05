@@ -53,6 +53,7 @@
         <module>serdes-with-references</module>
         <module>protobuf-validation</module>
         <module>tools/kafkasql-topic-import</module>
+        <module>tools/registry-java-client</module>
         <!--<module>camel-quarkus-kafka</module>-->
     </modules>
 

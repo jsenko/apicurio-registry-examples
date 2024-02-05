@@ -1,0 +1,11 @@
+syntax = "proto3";
+package com.avaloq.acp.bde.protobuf;
+
+import "google/protobuf/descriptor.proto";
+
+// This option is used in order for definition
+// of the version of the protobuf message
+extend google.protobuf.FileOptions {
+  string version = 98765;
+}
+

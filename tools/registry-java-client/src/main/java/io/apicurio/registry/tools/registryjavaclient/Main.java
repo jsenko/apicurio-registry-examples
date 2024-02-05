@@ -1,5 +1,5 @@
 /*
- * Copyright 2020 Red Hat
+ * Copyright 2023 JBoss Inc
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,40 +14,16 @@
  * limitations under the License.
  */
 
-package io.apicurio.registry.tools.kafkasqltopicimport;
+package io.apicurio.registry.tools.registryjavaclient;
 
-import lombok.*;
+import picocli.CommandLine;
 
-import java.util.List;
+public class Main {
 
+    public static void main(String[] args) {
 
-/**
- * @author Jakub Senko <em>m@jsenko.net</em>
- */
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-@Getter
-@Setter
-@EqualsAndHashCode
-@ToString
-public class Envelope {
-
-    //private String id;
-
-    private String topic;
-
-    private Integer partition;
-
-    private Long offset;
-
-    private Long ts;
-
-    private String key;
-
-    private String payload;
-
-    //private List<Header> headers;
-
-    private List<String> headers;
+        CommandLine cmd = new CommandLine(new RunCommand());
+        int exitCode = cmd.execute(args);
+        System.exit(exitCode);
+    }
 }

@@ -16,25 +16,26 @@
 
 package io.apicurio.registry.tools.kafkasqltopicimport;
 
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.google.common.collect.Streams;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.header.Header;
 import org.apache.kafka.common.header.internals.RecordHeader;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
-import org.slf4j.simple.SimpleLogger;
 import picocli.CommandLine.Command;
 
 import java.io.BufferedReader;
-import java.io.FileReader;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
-import java.util.Base64;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 
 import static picocli.CommandLine.Option;
 
@@ -59,51 +60,76 @@ public class ImportCommand implements Runnable {
 
     public void run() {
 
-        if(debug) {
-            System.setProperty(org.slf4j.simple.SimpleLogger.DEFAULT_LOG_LEVEL_KEY, "DEBUG");
-        } else {
-            System.setProperty(org.slf4j.simple.SimpleLogger.DEFAULT_LOG_LEVEL_KEY, "WARN");
+        mapper.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+
+//        if (debug) {
+//            System.setProperty(org.slf4j.simple.SimpleLogger.DEFAULT_LOG_LEVEL_KEY, "DEBUG");
+//        } else {
+//            System.setProperty(org.slf4j.simple.SimpleLogger.DEFAULT_LOG_LEVEL_KEY, "WARN");
+//        }
+
+        // Read data
+        //Dump dump = null;
+        List<Envelope> dump = new ArrayList<>();
+
+        try (BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(dumpFilePath)))) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                var dumpLine = mapper.readValue(line, Envelope.class);
+                dump.add(dumpLine);
+            }
+        } catch (IOException e) {
+            throw new RuntimeException(e);
         }
+
+/*
+        try (var in = new FileInputStream(dumpFilePath)) {
+            //var data = Files.readString(Path.of(dumpFilePath));
+
+            //dump = mapper.readValue(in, Dump.class);
+            dump = mapper.readValue(in, new TypeReference<List<Envelope>>() {
+            });
+
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+*/
 
         try (Producer<byte[], byte[]> producer = createKafkaProducer()) {
 
-            try (BufferedReader br = new BufferedReader(new FileReader(dumpFilePath))) {
-                String line;
-                while ((line = br.readLine()) != null) {
-                    var envelope = mapper.readValue(line, Envelope.class);
+            for (Envelope envelope : dump) {
 
-                    if (envelope.getHeaders() == null) {
-                        envelope.setHeaders(List.of());
-                    }
-                    if (envelope.getHeaders().size() % 2 != 0) {
-                        throw new RuntimeException("Invalid length of the headers field: " + envelope.getHeaders().size());
-                    }
 
-                    var key = envelope.getKey() != null ? Base64.getDecoder().decode(envelope.getKey()) : null;
-                    var value = envelope.getPayload() != null ? Base64.getDecoder().decode(envelope.getPayload()) : null;
-
-                    var record = new ProducerRecord<>(
-                            envelope.getTopic(),
-                            envelope.getPartition(),
-                            envelope.getTs(),
-                            key,
-                            value,
-                            Streams.zip(
-                                            Streams.zip(
-                                                    IntStream.range(0, Integer.MAX_VALUE).boxed(),
-                                                    envelope.getHeaders().stream(),
-                                                    Tuple::new
-                                            ).filter(t -> t.getA() % 2 == 0).map(Tuple::getB), // Even indexes: 0,2,4,...
-                                            Streams.zip(
-                                                    IntStream.range(0, Integer.MAX_VALUE).boxed(),
-                                                    envelope.getHeaders().stream(),
-                                                    Tuple::new
-                                            ).filter(t -> t.getA() % 2 == 1).map(Tuple::getB), // Odd indexes: 1,3,5,...
-                                            (k, v) -> new RecordHeader(k, v.getBytes(StandardCharsets.UTF_8)))
-                                    .collect(Collectors.toList())
-                    );
-                    producer.send(record);
+                if (envelope.getHeaders() == null) {
+                    envelope.setHeaders(List.of());
                 }
+
+
+                var key = envelope.getKey().getBytes();
+                byte[] value = null;
+                if (envelope.getPayload() != null) {
+                    value = fixCorruptedData(envelope.getPayload().getBytes());
+                }
+
+                // Read headers
+                if (envelope.getHeaders().size() % 2 != 0) {
+                    throw new RuntimeException("Invalid length of the headers field " + envelope.getHeaders().size() + " at " + envelope.getOffset());
+                }
+                List<Header> headers = new ArrayList<>();
+                for (int i = 0; i < envelope.getHeaders().size(); i += 2) {
+                    headers.add(new RecordHeader(envelope.getHeaders().get(i), envelope.getHeaders().get(i + 1).getBytes()));
+                }
+
+                var record = new ProducerRecord<>(
+                        "kafkasql-journal", //envelope.getTopic(),
+                        envelope.getPartition(),
+                        envelope.getTs(),
+                        key,
+                        value,
+                        headers
+                );
+                producer.send(record);
+
             }
 
             producer.flush();
@@ -125,7 +151,179 @@ public class ImportCommand implements Runnable {
         props.putIfAbsent(ProducerConfig.ACKS_CONFIG, "all");
         props.putIfAbsent(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
         props.putIfAbsent(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+        //props.putIfAbsent(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        //props.putIfAbsent(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
 
         return new KafkaProducer<>(props);
+    }
+
+
+    private byte[] fixCorruptedData(byte[] data) {
+
+        var ouput = ByteBuffer.allocate(data.length);
+/*
+        // ===================== Write content for debugging
+        var out = "[";
+        var first = true;
+        for (byte b : data) {
+            int bb = b >= 0 ? b : 256 + b;
+            if (!first) {
+                out = out + ", ";
+            }
+            first = false;
+            out = out + (bb == 0 ? " " : "") + (bb < 100 ? " " : "") + bb;
+        }
+        out = out + "]";
+        System.err.println("content data: " + out);
+        // =====================
+*/
+
+        ByteBuffer byteBuffer = ByteBuffer.wrap(data);
+        byte type = byteBuffer.get(); // the first byte is the message type ordinal, skip that
+        ouput.put(type);
+
+        if (type != 2) {
+            // not content
+            return data;
+        }
+
+        byte actionOrdinal = byteBuffer.get();
+        ouput.put(actionOrdinal);
+
+        // Canonical hash (length of string + string bytes)
+        String canonicalHash = null;
+        int hashLen = byteBuffer.getInt();
+        ouput.putInt(hashLen);
+        if (hashLen > 0) {
+            // hash should be 64 (@) characters
+            if(hashLen != 64) {
+                throw new RuntimeException("canonical hash length is " + hashLen);
+            }
+            byte[] bytes = new byte[hashLen];
+            byteBuffer.get(bytes);
+            ouput.put(bytes);
+            canonicalHash = new String(bytes, StandardCharsets.UTF_8);
+        }
+
+        // TODO: There should be no references in this version, making things easier
+
+        // Skip the next four bytes
+        byteBuffer.position(byteBuffer.position() + 4);
+
+        // TODO: Some content starts with 0xBFBD7B, which is two junk (?) bytes and then "{"
+        // TODO: Remove them?
+
+
+        var content = new byte[byteBuffer.remaining()];
+        byteBuffer.get(content);
+        ouput.putInt(content.length);
+        ouput.put(content);
+/*
+        // =====================
+        // We need to recalculate corrupted content sizes.
+        // We take advantage of the content size being written in four bytes, but very
+        // rarely being that large.
+        var buff = byteBuffer.duplicate();
+        var bbytes = new byte[buff.remaining()];
+        buff.get(bbytes);
+        // look for 2 null bytes, from reverse
+        var reference_count_i = -1;
+        var content_count_i = -1;
+        for (int i = bbytes.length - 2; i >= 0; i--) {
+            if (bbytes[i] == 0 && bbytes[i + 1] == 0) {
+                if (i == 0 || bbytes[i - 1] != 0) {
+                    // Found 2 zero bytes preceding a non-zero (or no) byte, it is either reference count, content count, or bogus
+                    if (reference_count_i == -1) {
+                        reference_count_i = i;
+                    } else if (content_count_i == -1) {
+                        content_count_i = i;
+                    } else {
+                        throw new RuntimeException("bogus");
+                    }
+                }
+            }
+        }
+        // Mark the count as content if there are no references
+        if (reference_count_i != -1 && content_count_i == -1) {
+            content_count_i = reference_count_i;
+            reference_count_i = -1;
+        }
+        // Now fix the byte values
+        // Fix the content length
+        if (content_count_i != -1) {
+            if (reference_count_i == -1) {
+                var size = bbytes.length - content_count_i - 4;
+                byteBuffer.putInt(byteBuffer.position() + content_count_i, size);
+            } else {
+                var size = reference_count_i - content_count_i - 4;
+                byteBuffer.putInt(byteBuffer.position() + content_count_i, size);
+            }
+        }
+        // Fix the references length
+        if (reference_count_i != -1) {
+            var size = bbytes.length - reference_count_i - 4;
+            byteBuffer.putInt(byteBuffer.position() + reference_count_i, size);
+        }
+        // =====================
+
+
+        // Content (length of content + content bytes)
+        String content = null;
+        int numContentBytes = byteBuffer.getInt();
+
+
+//        if ("67c1f422fa17fe80374615eac0f9d6aeac99b7f4f26d89cf2c0dfc2ee9ebc998".equals(canonicalHash)) {
+//            // Fix the two weird bytes
+//            // [191, 189]
+//            // 0xBFBD
+//            byteBuffer.get();
+//            numContentBytes--;
+//            byteBuffer.get();
+//            numContentBytes--;
+//        }
+//
+//
+//        if ("9ed43cb1f094c032a802e51e5e0da44a857f6b78d22336e16f15d4ae53a711e8".equals(canonicalHash)) {
+//            // Fix the two weird bytes
+//            // [191, 189]
+//            // 0xBFBD
+//            byteBuffer.get();
+//            numContentBytes--;
+//            byteBuffer.get();
+//            numContentBytes--;
+//        }
+
+        ouput.putInt(numContentBytes);
+        if (numContentBytes > 0) {
+            byte[] contentBytes = new byte[numContentBytes];
+            byteBuffer.get(contentBytes);
+            ouput.put(contentBytes);
+            content = new String(contentBytes);
+        }
+
+        String serializedReferences = null;
+        //When deserializing from other storage versions, the references byte count might not be there, so we first check if there are anything remaining in the buffer
+        if (byteBuffer.hasRemaining()) {
+            // References (length of references + references bytes)
+            int referencesLen = byteBuffer.getInt();
+            ouput.putInt(referencesLen);
+            if (referencesLen > 0) {
+                // TODO This should not happen in this version
+                throw new RuntimeException("references should not be there");
+                //byte[] bytes = new byte[referencesLen];
+                //byteBuffer.get(bytes);
+                //ouput.put(bytes);
+                //serializedReferences = new String(bytes, StandardCharsets.UTF_8);
+            }
+        }
+*/
+        if (byteBuffer.hasRemaining()) {
+            throw new RuntimeException("has remaining");
+        }
+
+        ouput.flip();
+        var res = new byte[ouput.remaining()];
+        ouput.get(res);
+        return res;
     }
 }
